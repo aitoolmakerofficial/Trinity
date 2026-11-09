@@ -1,0 +1,165 @@
+name: Build Dressing Room F6
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Get sources
+        uses: actions/checkout@v4
+
+      - name: Prepare standalone prototype
+        shell: pwsh
+        run: |
+          @'
+          #!/usr/bin/env python3
+          """Convert a freshly cloned XeTrinityz/Trinity source tree into Dressing Room MVP-0.
+          Requires the MIT-licensed Trinity source tree, not the Trinity or Live Transmog mods installed.
+          """
+          import pathlib
+          import sys
+          
+          root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else '.').resolve()
+          
+          
+          def edit(rel, changes):
+              path = root / rel
+              data = path.read_text(encoding='utf-8')
+              for old, new in changes:
+                  n = data.count(old)
+                  if n != 1:
+                      raise SystemExit(f'ERROR {rel}: expected 1 occurrence, got {n}: {old[:90]!r}. Check repo version.')
+                  data = data.replace(old, new, 1)
+              path.write_text(data, encoding='utf-8', newline='\n')
+              print('Patched', rel)
+          
+          
+          # F6 = VK_F6 = 0x75; Home stays completely free as an opening hotkey.
+          edit('src/core/state.h', [
+              ('int          openKeyVk  = 0x2D;          // VK_INSERT',
+               'int          openKeyVk  = 0x75;          // VK_F6 (Dressing Room)')
+          ])
+          
+          # Own ASI and settings path, so the test build will not overwrite existing Trinity files.
+          edit('CMakeLists.txt', [
+              ('OUTPUT_NAME "Trinity"', 'OUTPUT_NAME "DressingRoom"')
+          ])
+          
+          settings_path = root / 'src/core/settings.cpp'
+          settings = settings_path.read_text(encoding='utf-8')
+          if 'Trinity.ini' not in settings:
+              raise SystemExit('ERROR: src/core/settings.cpp: Trinity.ini not found')
+          settings_path.write_text(settings.replace('Trinity.ini', 'DressingRoom.ini'), encoding='utf-8', newline='\n')
+          print('Patched src/core/settings.cpp')
+          
+          # Only install the inventory-reading subsystem in this first, read-only prototype.
+          edit('src/core/mod.cpp', [
+              ('        game::Player::Install();    // God Mode / Infinite Stamina\n'
+               '        game::Teleport::Install();  // Live position tracking / Fast Travel\n'
+               '        game::Inventory::Install(); // Item browser / quantity editor\n'
+               '        game::World::Install();     // Game Speed / Time of Day (Freeze, Advance)\n'
+               '        game::Dye::Install();       // Armor dye / material / repair look\n'
+               '        game::Equipment::Install(); // Abyss-gear socket editor\n'
+               '        game::Friendly::Install();  // Trust Multiplier (gift/feed/tame)',
+               '        game::Inventory::Install(); // Read-only inventory browser for the prototype'),
+              ('        game::Player::Remove();\n'
+               '        game::Teleport::Remove();\n'
+               '        game::Inventory::Remove();\n'
+               '        game::World::Remove();\n'
+               '        game::Dye::Remove();\n'
+               '        game::Equipment::Remove();\n'
+               '        game::Friendly::Remove();',
+               '        game::Inventory::Remove();'),
+              ('LOG_OK("Ready - INSERT (or LB + DOWN on controller) toggles the menu in-game.");',
+               'LOG_OK("Dressing Room MVP-0 ready: press F6.");'),
+          ])
+          
+          wardrobe_function = '''    // MVP-0: read-only proof that the game inventory can be read and filtered.
+              // Deliberately does NOT equip, dye, add or remove items.
+              static void RenderDressingRoom()
+              {
+                  ui::Begin("Owned equipment (MVP-0)");
+                  if (!game::Inventory::Ready())
+                  {
+                      ui::Option("Inventory not ready", "Load a save and open the in-game inventory once.");
+                      ui::End();
+                      return;
+                  }
+          
+                  game::Inventory::Refresh();
+                  ui::ListJump();
+                  if (ui::Option("Refresh", "Re-read the actual inventory from the game."))
+                      game::Inventory::ForceRefresh();
+          
+                  int shown = 0;
+                  for (int st = 0; st < game::Inventory::StorageCount(); ++st)
+                  {
+                      // Keep only the player's carried inventory (not bank or wardrobe).
+                      const char* storage_key = game::Inventory::StorageKey(st);
+                      if (!storage_key || std::strcmp(storage_key, "Character") != 0)
+                          continue;
+                      for (int cat = 0; cat < game::Inventory::CategoryCount(st); ++cat)
+                      {
+                          const char* tab = game::Inventory::CategoryTab(st, cat);
+                          if (!tab || std::strcmp(tab, "Equipment") != 0)
+                              continue;
+                          for (int idx = 0; idx < game::Inventory::ItemCount(st, cat); ++idx)
+                          {
+                              game::Inventory::ItemInfo item{};
+                              if (!game::Inventory::GetItemInfo(st, cat, idx, &item) || !item.name)
+                                  continue;
+                              ++shown;
+                              if (ui::OptionItem(item.name, item.icon,
+                                                 "TEST ONLY - selection does not change equipment yet."))
+                                  ui::Toast("Found: %s  [id %u]", item.name,
+                                            static_cast<unsigned>(item.typeId));
+                          }
+                      }
+                  }
+                  if (!shown)
+                      ui::Option("No carried equipment found", "Open inventory once; check your character and game build.");
+                  ui::End();
+              }
+          
+          '''
+          edit('src/gui/menu.cpp', [
+              ('static const char* const kTabs[] = { "PLAYER", "TRAVEL", "INVENTORY", "WORLD", "SYSTEM" };',
+               'static const char* const kTabs[] = { "DRESSING ROOM" };'),
+              ('    static void RenderPlayer()\n    {', wardrobe_function + '    static void RenderPlayer()\n    {'),
+              ('ui::SetTabs(kTabs, TabCount)', 'ui::SetTabs(kTabs, 1)'),
+              ('case TabPlayer: RenderPlayer(); break;', 'case TabPlayer: RenderDressingRoom(); break;'),
+              ('default:        RenderPlayer(); break;', 'default:        RenderDressingRoom(); break;'),
+              ('else                              RenderPlayer();', 'else                              RenderDressingRoom();'),
+          ])
+          
+          print('DONE: build with CMake (see README_RU.md).')
+          '@ | Set-Content -Path prepare.py -Encoding utf8
+          python prepare.py .
+
+      - name: Configure Visual Studio build
+        shell: pwsh
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Compile ASI
+        shell: pwsh
+        run: cmake --build build --config Release --parallel 2
+
+      - name: Verify ASI
+        shell: pwsh
+        run: |
+          if (!(Test-Path 'build/Release/DressingRoom.asi')) {
+            throw 'DressingRoom.asi was not generated - inspect the compilation log above.'
+          }
+
+      - name: Downloadable ASI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DressingRoom-F6
+          path: build/Release/DressingRoom.asi
+          if-no-files-found: error
